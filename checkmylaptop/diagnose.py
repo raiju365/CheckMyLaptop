@@ -2,6 +2,9 @@
 
 from datetime import datetime, timedelta
 
+from .performance import GIB, summarize_performance
+from .deep_diagnostics import component_health, detail_data
+
 EVENT_GROUPS = {
     "restart": {("microsoft-windows-kernel-power", 41)},
     "display": {("display", 4101)},
@@ -15,35 +18,50 @@ EVENT_GROUPS = {
     },
     "memory": {("microsoft-windows-memorydiagnostics-results", 1202)},
     "crash": {("microsoft-windows-wer-systemerrorreporting", 1001)},
+    "firmware_limit": {("microsoft-windows-kernel-processor-power", 37)},
+    "file_system": {("microsoft-windows-ntfs", 55)},
+    "update_failure": {("microsoft-windows-windowsupdateclient", 20)},
+    "memory_exhaustion": {("microsoft-windows-resource-exhaustion-detector", 2004)},
+    "app_failures": {("application error", 1000), ("application hang", 1002)},
 }
 PRIORITIES = {"high": 0, "attention": 1, "info": 2}
 MANUAL_COVERAGE = [
-    "CPU/GPU temperatures and fan operation",
+    "Direct CPU/GPU sensor temperatures, fan RPM and charger or battery load tests",
     "Dedicated RAM, CPU and GPU stability tests",
     "Display pixels, keyboard and touchpad operation",
-    "Speaker, microphone, camera and Wi-Fi functionality",
+    "Speaker, microphone, camera and end-to-end network connectivity",
     "Individual USB, charging and video ports",
+    "Malware, Windows system-file verification and crash-dump analysis",
     "Physical inspection and motherboard faults",
 ]
 
 
 def nearby_events(first: list[dict], second: list[dict]) -> int:
-    first_times = [datetime.fromisoformat(entry["time"]) for entry in first]
-    second_times = [datetime.fromisoformat(entry["time"]) for entry in second]
+    def timestamps(entries):
+        for entry in entries:
+            try:
+                value = datetime.fromisoformat(entry.get("time", "").replace("Z", "+00:00"))
+            except (AttributeError, ValueError):
+                continue
+            if value.tzinfo is not None:
+                yield value
+
+    first_times = list(timestamps(first))
+    second_times = list(timestamps(second))
     window = timedelta(minutes=2)
     return sum(any(abs(event - other) <= window for other in second_times)
                for event in first_times)
 
 
-def diagnose(report: dict) -> list[dict]:
+def diagnose(report: dict, performance: dict | None = None) -> list[dict]:
     def data(section, default):
         return report["sections"].get(section, {}).get("data", default)
 
     findings = []
 
-    def add(code, severity, title, evidence, action):
+    def add(code, severity, title, evidence, action, **details):
         findings.append(dict(code=code, severity=severity, title=title,
-                             evidence=evidence, action=action))
+                             evidence=evidence, action=action, **details))
 
     entries = data("events", {}).get("entries", [])
     events = {
@@ -67,7 +85,7 @@ def diagnose(report: dict) -> list[dict]:
             if retries >= 2:
                 evidence.append(f"{retries} I/O retries in this boot reference the same Windows disk number.")
             add("storage_health", "high", "Storage needs attention", evidence,
-                "Back up important files, then run the manufacturer's storage diagnostic.")
+                "Back up important files, then run the manufacturer's storage diagnostic.", disk=disk["number"])
     if events["storage"]:
         add("storage_events", "attention", "Windows recorded storage interruptions",
             [f"{len(events['storage'])} selected storage events in the last 14 days."],
@@ -81,33 +99,72 @@ def diagnose(report: dict) -> list[dict]:
                 "Compare expected runtime with actual runtime and use the maker's battery test if needed.")
     perf = data("performance", {})
     size, free = perf.get("system_size"), perf.get("system_free")
-    if size and free is not None and free < min(size * 0.10, 15 * 1024**3):
+    if size and free is not None and free < min(size * 0.10, 15 * GIB):
         add("free_space", "attention", "Low space on the Windows drive",
-            [f"{perf.get('system_drive', 'System drive')} has {free / 1024**3:.1f} GiB free."],
+            [f"{perf.get('system_drive', 'System drive')} has {free / GIB:.1f} GiB free."],
             "Review Windows Settings → System → Storage and free space before large updates.")
-    samples = perf.get("samples", [])
-    low = [
-        sample for sample in samples
-        if sample.get("memory_available_mib") is not None and
-        sample["memory_available_mib"] < min(1024, sample["memory_total_mib"] * 0.10)
-    ]
-    paging = [sample for sample in low
-              if (sample.get("pages_input_sec") or 0) >= 50 and
-              (sample.get("disk_queue") or 0) >= 1]
-    if len(paging) >= 3:
-        add("memory_paging", "attention", "Memory pressure and disk activity coincided",
-            [f"{len(paging)} of {len(samples)} samples had low available RAM, page reads, and a disk queue."],
-            "Check Task Manager for memory-heavy apps, close one you do not need, then scan again.")
-    elif len(low) >= 3:
-        add("memory_low", "attention", "Low available memory during the scan",
-            [f"Available RAM was low in {len(low)} of {len(samples)} samples."],
-            "Review memory use in Task Manager and scan again after closing unused apps.")
+
+    metrics = performance if performance is not None else summarize_performance(perf)
+    needed = metrics["required"]
+    sample_count = metrics["samples"]
+    low = metrics["low_count"]
+    paging = metrics["paging_count"]
+    high_commit = metrics["commit_high_count"]
+    commit_and_low = metrics["commit_and_low_count"]
+    if low >= needed:
+        evidence = [
+            f"Available RAM: {metrics['available_min_mib']:.0f}–{metrics['available_max_mib']:.0f} MiB "
+            f"(median {metrics['available_median_mib']:.0f} MiB). "
+            f"{low}/{sample_count} samples were below the scan threshold.",
+        ]
+        if paging >= needed:
+            evidence.append(f"Low RAM, page reads and a disk queue coincided in {paging}/{sample_count} samples.")
+        if commit_and_low >= needed:
+            evidence.append(f"Low RAM and commit usage of at least 90% coincided in {commit_and_low}/{sample_count} samples.")
+        apps = metrics["processes"]
+        if apps:
+            largest = apps[0]
+            evidence.append(
+                f"Largest process group at the end: {largest['name']} "
+                f"({largest['count']} instances, {largest['working_set_mib']:.0f} MiB resident in total)."
+            )
+        if paging >= needed:
+            code, title = "memory_paging", "Memory pressure and disk activity coincided"
+        elif commit_and_low >= needed:
+            code, title = "memory_commit", "Low available RAM and high committed memory"
+        else:
+            code, title = "memory_low", "Low available memory during the scan"
+        add(code, "attention", title, evidence,
+            "Review the process list below, close an unused application if appropriate, then repeat the scan.")
+    if high_commit >= needed and commit_and_low < needed:
+        add("commit_limit", "attention", "Committed memory approached its limit",
+            [f"{high_commit}/{sample_count} samples reached at least 90% of the reported commit limit.",
+             "Committed memory and physical RAM usage measure different things."],
+            "Check the largest processes by commit size in Task Manager and repeat the scan.")
+    if metrics["cpu_high_count"] >= needed:
+        add("cpu_load", "attention", "Sustained high CPU use during the scan",
+            [f"CPU usage was at least 90% in {metrics['cpu_high_count']}/{sample_count} samples."],
+            "Sort Task Manager by CPU to identify active workloads, then compare with a scan after they finish.")
+    if metrics["queue_high_count"] >= needed and paging < needed:
+        evidence = [f"The combined disk queue reached two in {metrics['queue_high_count']}/{sample_count} samples."]
+        if events["storage"]:
+            evidence.append("Recent storage events were also found. Their relation to this scan is unverified.")
+        add("disk_activity", "attention", "Sustained disk queue during the scan", evidence,
+            "Sort Task Manager by Disk and check for a background workload. Review any separate storage findings.")
+
     display_near_crashes = nearby_events(events["display"], events["crash"])
     if display_near_crashes:
         add("graphics_crash_timing", "attention", "Graphics recovery occurred near a system crash",
             [f"{display_near_crashes} graphics recovery events within two minutes of a bugcheck log.",
              "Event timing can suggest a shared incident. A crash dump is needed to investigate the cause."],
             "Check the manufacturer's graphics driver and have a technician review the crash dump.")
+    serious_hardware = [entry for entry in events["hardware"] if entry["id"] in {18, 20, 46}]
+    hardware_near_crashes = nearby_events(serious_hardware, events["crash"])
+    if hardware_near_crashes:
+        add("hardware_crash_timing", "high", "Hardware error reports occurred near a system crash",
+            [f"{hardware_near_crashes} selected WHEA events within two minutes of a bugcheck log.",
+             "The timing supports further investigation. These events do not isolate a specific component."],
+            "Run the manufacturer's extended diagnostics and have a technician review the WHEA and crash records.")
     for group, severity, title, evidence, action in (
         ("memory", "high", "Windows memory test reported errors",
          "Windows logged a memory diagnostic failure.",
@@ -134,5 +191,40 @@ def diagnose(report: dict) -> list[dict]:
         add("device_status", "attention", "Windows reports a device problem",
             [f"{device['Name']} · Device Manager code {device['ConfigManagerErrorCode']}."],
             "Open Device Manager to see the device status and check the manufacturer's support page.")
+
+    sections = report["sections"]
+    for row in detail_data(sections, "volumes", "volumes") or []:
+        if row.get("dirty") is True:
+            add("volume_dirty", "attention", "Windows marked a file system dirty",
+                [f"Volume {row['drive']} has its dirty flag set."],
+                "Back up important files and check the volume with Windows Error checking.")
+    health, verified = component_health(sections)
+    if health in {"Repairable", "NonRepairable"}:
+        source = "Component-store verification" if verified else "Windows servicing health record"
+        add("component_store", "attention", "Windows component-store corruption reported",
+            [f"{source}: {health}."],
+            "Review Windows servicing errors and use the documented repair procedure if appropriate.")
+    reboot = detail_data(sections, "windows_health", "reboot") or {}
+    if any(value is True for value in reboot.values()):
+        add("servicing_reboot", "info", "Windows servicing reports a pending restart",
+            ["A servicing or Windows Update restart indicator is present."],
+            "Save your work and check Windows Update for a restart request.")
+    for group, title, action in (
+        ("file_system", "Windows logged NTFS corruption", "Review the original events to identify the volume and back up important files."),
+        ("firmware_limit", "Firmware limited processor speed", "Compare AC and battery operation and review the manufacturer's power settings."),
+        ("memory_exhaustion", "Windows logged virtual-memory exhaustion", "Review commit usage and page-file configuration, then repeat the scan during the slowdown."),
+        ("update_failure", "Windows logged update installation failures", "Open Windows Update history to see the affected updates and whether they later installed."),
+        ("app_failures", "Windows logged application crashes or hangs", "Use Reliability Monitor to check which applications repeatedly failed."),
+    ):
+        if events[group]:
+            add(group, "attention" if group in {"file_system", "memory_exhaustion"} else "info",
+                title, [f"{len(events[group])} matching events in the last 14 days."], action)
+    for adapter in data("network", []):
+        if (adapter.get("ipv4_link_local_only") is True and
+                adapter.get("ipv4_connectivity") in {"LocalNetwork", "Subnet", "NoTraffic"} and
+                adapter.get("ipv6_connectivity") in {"LocalNetwork", "Subnet", "NoTraffic"}):
+            add("network_addressing", "info", "Connected adapter has limited IP configuration",
+                [f"{adapter['description']}: only a link-local IPv4 address; Windows reports limited connectivity."],
+                "If the network should provide internet access, check its DHCP settings and compare another device.")
 
     return sorted(findings, key=lambda item: PRIORITIES[item["severity"]])

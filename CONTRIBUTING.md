@@ -10,7 +10,7 @@ From a Windows x64 machine with Python 3.12 and Tcl/Tk:
 
 ```powershell
 py -3.12 -m pip install -r requirements-build.txt
-py -3.12 -m PyInstaller --clean --noconfirm --onefile --windowed --name CheckMyLaptop --add-data "checkmylaptop/windows.ps1;checkmylaptop" run_checkmylaptop.py
+py -3.12 -m PyInstaller --clean --noconfirm --onedir --windowed --name CheckMyLaptop --add-data "checkmylaptop/windows.ps1;checkmylaptop" run_checkmylaptop.py
 ```
 
-Launch `dist/CheckMyLaptop.exe` and verify a live scan and export on a Windows laptop before sharing a build. Push a matching version tag such as `v0.1.0` to build a release asset. The workflow uploads it to a GitHub draft release for review.
+Launch `dist/CheckMyLaptop/CheckMyLaptop.exe` and verify a live scan and export on a Windows laptop before sharing a build. Push a matching version tag to build a release asset. The workflow packages the whole application folder in a ZIP and uploads it to a GitHub draft release for review.

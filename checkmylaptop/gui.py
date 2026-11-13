@@ -7,13 +7,13 @@ from queue import Empty, Queue
 from threading import Thread
 from tkinter import filedialog, messagebox, ttk
 
-from .collect import scan
+from .collect import CONSENT_NOTICE, VERIFICATION_NOTICE, scan
 from .demo import snapshot
 from .report import build_report, render_text
 
 
 class Application:
-    def __init__(self, root: tk.Tk, demo: bool):
+    def __init__(self, root: tk.Tk, demo: bool, verify_windows: bool = False):
         self.root = root
         self.demo = demo
         self.report = None
@@ -38,7 +38,7 @@ class Application:
         shell = ttk.Frame(root, padding=22, style="Shell.TFrame")
         shell.pack(fill="both", expand=True)
         ttk.Label(shell, text="CheckMyLaptop", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(shell, text="One-click Windows laptop diagnostics",
+        ttk.Label(shell, text="In-depth Windows laptop diagnostics",
                   style="Body.TLabel").pack(anchor="w", pady=(2, 14))
 
         actions = ttk.Frame(shell, style="Shell.TFrame")
@@ -49,6 +49,13 @@ class Application:
         self.export_button = ttk.Button(actions, text="Save report", command=self.export,
                                         state="disabled", padding=(10, 8))
         self.export_button.pack(side="left", padx=8)
+        self.verify = tk.BooleanVar(value=verify_windows)
+        if not demo:
+            self.verify_option = ttk.Checkbutton(
+                shell, text="Verify Windows components (run as administrator · up to 15 min)",
+                variable=self.verify,
+            )
+            self.verify_option.pack(anchor="w", pady=(0, 8))
 
         self.status = tk.StringVar(value="Simulated data" if demo else "Ready to scan · runs locally")
         ttk.Label(shell, textvariable=self.status, style="Body.TLabel").pack(anchor="w", pady=(0, 8))
@@ -79,18 +86,34 @@ class Application:
         self.text.configure(state="disabled")
 
     def start(self):
+        allowed = False
+        verify_windows = self.verify.get()
+        if not self.demo:
+            notice = CONSENT_NOTICE
+            if verify_windows:
+                notice += "\n\n" + VERIFICATION_NOTICE
+            allowed = messagebox.askyesno(
+                "Allow diagnostic scan?", notice,
+                parent=self.root, default=messagebox.NO,
+            )
+            if not allowed:
+                self.status.set("Scan canceled")
+                return
+            self.verify_option.configure(state="disabled")
         self.scan_button.configure(state="disabled")
         self.export_button.configure(state="disabled")
         self.status.set("Collecting diagnostic data…")
         self.progress.pack(fill="x", side="bottom", pady=(8, 0))
         self.progress.start(14)
-        Thread(target=self.run_scan, daemon=True).start()
+        Thread(target=self.run_scan, args=(allowed, verify_windows), daemon=True).start()
         self.root.after(75, self.poll)
 
-    def run_scan(self):
+    def run_scan(self, allowed, verify_windows):
         try:
             data = snapshot() if self.demo else scan(
                 progress=lambda label: self.messages.put(("progress", label)),
+                allow=allowed,
+                verify_windows=verify_windows,
             )
             self.messages.put(("report", build_report(data, demo=self.demo)))
         except Exception:
@@ -101,11 +124,13 @@ class Application:
             while True:
                 kind, value = self.messages.get_nowait()
                 if kind == "progress":
-                    self.status.set(f"Waiting for {value.lower()}…")
+                    self.status.set(value)
                     continue
                 self.progress.stop()
                 self.progress.pack_forget()
                 self.scan_button.configure(state="normal")
+                if not self.demo:
+                    self.verify_option.configure(state="normal")
                 if kind == "report":
                     self.report = value
                     self.show(render_text(value))
@@ -137,7 +162,7 @@ class Application:
             self.status.set("Report saved")
 
 
-def run(*, demo=False):
+def run(*, demo=False, verify_windows=False):
     root = tk.Tk()
-    Application(root, demo)
+    Application(root, demo, verify_windows)
     root.mainloop()

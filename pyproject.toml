@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "checkmylaptop"
-version = "0.1.0"
-description = "One-click, evidence-based laptop diagnostics for Windows."
+version = "0.2.0"
+description = "Evidence-based laptop diagnostics for Windows."
 readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "MIT"}

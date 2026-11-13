@@ -1,10 +1,11 @@
 """Read Windows diagnostic data without elevation or system changes."""
 
+import ctypes
 import json
 import os
 import subprocess
 import sys
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
@@ -15,11 +16,40 @@ SECTIONS = {
     "storage": ("Storage", list),
     "events": ("System event history", dict),
     "performance": ("Live performance and free space", dict),
+    "network": ("Network adapter status", list),
+    "volumes": ("Local volumes and file systems", dict),
+    "drivers": ("Device drivers", dict),
+    "platform": ("Firmware, power and memory modules", dict),
+    "windows_health": ("Windows servicing and page file", dict),
+    "protection": ("Windows protection status", dict),
 }
+DETAIL_SECTIONS = {
+    "volumes": {"volumes": "Fixed volumes", "disk_map": "Volume-to-disk mapping"},
+    "drivers": {"devices": "Present devices and driver packages"},
+    "platform": {"firmware": "BIOS and boot time", "memory": "Memory modules",
+                 "power": "AC and battery status", "thermal": "ACPI thermal zones"},
+    "windows_health": {"reboot": "Servicing reboot indicators", "page_file": "Page-file usage",
+                       "component_store": "Previously recorded component-store health"},
+    "protection": {"secure_boot": "Secure Boot", "tpm": "TPM", "firewall": "Windows Firewall",
+                   "defender": "Microsoft Defender", "encryption": "System-volume encryption"},
+}
+CONSENT_NOTICE = (
+    "CheckMyLaptop will read local hardware, drivers, Windows events, running process names, "
+    "network status and Windows protection settings. It will use the permissions of the current "
+    "Windows session. Reports stay local and are only saved when you choose to export. "
+    "The scan makes no repairs or network probes. Windows may write a servicing log."
+)
+VERIFICATION_NOTICE = (
+    "Windows component verification can take up to 15 minutes and writes a Windows servicing log."
+)
 SCRIPT = Path(__file__).with_name("windows.ps1")
 
 
 def read_section(section: str) -> dict:
+    return _read_collector(section, SECTIONS[section][1], timeout=40)
+
+
+def _read_collector(section: str, expected_type: type, *, timeout: int) -> dict:
     powershell = Path(os.environ.get("SystemRoot", r"C:\Windows")) / (
         r"System32\WindowsPowerShell\v1.0\powershell.exe"
     )
@@ -31,11 +61,11 @@ def read_section(section: str) -> dict:
     ]
     try:
         process = subprocess.run(
-            command, capture_output=True, timeout=40, check=True,
+            command, capture_output=True, timeout=timeout, check=True,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         data = json.loads(process.stdout.decode("utf-8-sig"))
-        if not isinstance(data, SECTIONS[section][1]):
+        if not isinstance(data, expected_type):
             raise ValueError("Unexpected section format")
     except subprocess.TimeoutExpired:
         return {"state": "unavailable", "reason": "The Windows query timed out."}
@@ -47,14 +77,34 @@ def read_section(section: str) -> dict:
     return {"state": "checked", "data": data}
 
 
-def scan(progress: Callable[[str], None] | None = None) -> dict:
+def scan(progress: Callable[[str], None] | None = None, *, allow: bool = False,
+         verify_windows: bool = False) -> dict:
+    if not allow:
+        raise PermissionError("Live diagnostics require explicit consent for each scan.")
     if sys.platform != "win32":
         raise RuntimeError("Live scans require Windows. Use --demo on other platforms.")
-    report = {"scanned_at": datetime.now(timezone.utc).isoformat(), "sections": {}}
+    administrator = bool(ctypes.windll.shell32.IsUserAnAdmin())
+    report = {"scanned_at": datetime.now(timezone.utc).isoformat(), "sections": {},
+              "administrator": administrator}
     with ThreadPoolExecutor(max_workers=4) as executor:
-        pending = {name: executor.submit(read_section, name) for name in SECTIONS}
-        for name, (label, _) in SECTIONS.items():
+        inventory_checks = {
+            executor.submit(read_section, name): name
+            for name in SECTIONS if name != "performance"
+        }
+        for future in as_completed(inventory_checks):
+            name = inventory_checks[future]
+            report["sections"][name] = future.result()
             if progress:
-                progress(label)
-            report["sections"][name] = pending[name].result()
+                progress(f"Completed {SECTIONS[name][0].lower()}")
+    if progress:
+        progress("Sampling CPU, memory and disk…")
+    report["sections"]["performance"] = read_section("performance")
+    if verify_windows:
+        if administrator:
+            if progress:
+                progress("Verifying the Windows component store. This can take several minutes…")
+            result = _read_collector("verify_windows", dict, timeout=900)
+        else:
+            result = {"state": "unavailable", "reason": "Verification requires Administrator privileges."}
+        report["sections"]["windows_verification"] = result
     return report

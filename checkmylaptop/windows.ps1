@@ -1,11 +1,14 @@
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('inventory', 'battery', 'storage', 'events', 'performance')]
+    [ValidateSet('inventory', 'battery', 'storage', 'events', 'performance', 'network',
+                 'volumes', 'drivers', 'platform', 'windows_health', 'protection', 'verify_windows')]
     [string]$Section
 )
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+$WarningPreference = 'SilentlyContinue'
+$env:PSModulePath = Join-Path $PSHOME 'Modules'
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
 
 function Get-BatteryData {
@@ -34,14 +37,33 @@ function Get-BatteryData {
 }
 
 function Get-StorageData {
+    $physical = @()
+    try { $physical = @(Get-PhysicalDisk) } catch {}
     foreach ($disk in Get-Disk) {
         $counter = $null
         try { $counter = Get-StorageReliabilityCounter -Disk $disk } catch {}
+        $source = 'Get-Disk'
+        if ($null -eq $counter -or ($null -eq $counter.Wear -and
+            $null -eq $counter.ReadErrorsUncorrected -and $null -eq $counter.WriteErrorsUncorrected)) {
+            if ($disk.UniqueId) {
+                $id = $disk.UniqueId.Trim()
+                $matches = @($physical | Where-Object { $_.UniqueId -and $_.UniqueId.Trim() -eq $id })
+                if ($matches.Count -eq 1) {
+                    try {
+                        $alternate = Get-StorageReliabilityCounter -PhysicalDisk $matches[0]
+                        if ($null -ne $alternate) { $counter = $alternate; $source = 'Get-PhysicalDisk' }
+                    } catch {}
+                }
+            }
+        }
         [ordered]@{
             number = $disk.Number
             model = $disk.FriendlyName
             health = [string]$disk.HealthStatus
             size = $disk.Size
+            bus = [string]$disk.BusType
+            operational = @($disk.OperationalStatus | ForEach-Object { [string]$_ })
+            counter_source = $(if ($null -ne $counter) { $source })
             temperature = $counter.Temperature
             wear = $counter.Wear
             read_uncorrected = $counter.ReadErrorsUncorrected
@@ -61,12 +83,18 @@ function Get-EventData {
         @{ ProviderName = 'storahci'; Id = 129 },
         @{ ProviderName = 'stornvme'; Id = 129 },
         @{ ProviderName = 'Microsoft-Windows-WER-SystemErrorReporting'; Id = 1001 },
-        @{ ProviderName = 'Microsoft-Windows-MemoryDiagnostics-Results'; Id = @(1101, 1201, 1202) }
+        @{ ProviderName = 'Microsoft-Windows-MemoryDiagnostics-Results'; Id = @(1101, 1201, 1202) },
+        @{ ProviderName = 'Microsoft-Windows-Kernel-Processor-Power'; Id = 37 },
+        @{ ProviderName = 'Microsoft-Windows-Ntfs'; Id = 55 },
+        @{ ProviderName = 'Microsoft-Windows-WindowsUpdateClient'; Id = 20 },
+        @{ ProviderName = 'Microsoft-Windows-Resource-Exhaustion-Detector'; Id = 2004 },
+        @{ ProviderName = 'Application Error'; Id = 1000; LogName = 'Application' },
+        @{ ProviderName = 'Application Hang'; Id = 1002; LogName = 'Application' }
     )
     $unavailable = @()
     $events = @(
         foreach ($filter in $queries) {
-            $filter.LogName = 'System'
+            if (-not $filter.ContainsKey('LogName')) { $filter.LogName = 'System' }
             $filter.StartTime = $start
             try {
                 $entries = Get-WinEvent -FilterHashtable $filter -MaxEvents 80
@@ -102,7 +130,7 @@ function Get-EventData {
             }
         }
     )
-    [ordered]@{ entries = $events; unavailable = $unavailable }
+    [ordered]@{ entries = $events; unavailable = $unavailable; query_count = $queries.Count }
 }
 
 function Get-InventoryData {
@@ -128,10 +156,200 @@ function Get-InventoryData {
     }
 }
 
+function Get-ProcessData {
+    Get-Process | Where-Object { $_.Id -notin @(0, 4, $PID) } |
+        Group-Object ProcessName | ForEach-Object {
+            [ordered]@{
+                name = $_.Name
+                count = $_.Count
+                working_set_bytes = ($_.Group | Measure-Object WorkingSet64 -Sum).Sum
+                private_bytes = ($_.Group | Measure-Object PrivateMemorySize64 -Sum).Sum
+            }
+        } | Sort-Object { $_.working_set_bytes } -Descending | Select-Object -First 12
+}
+
+function Get-NetworkData {
+    $profiles = $null
+    try { $profiles = @(Get-NetConnectionProfile) } catch {}
+    foreach ($adapter in Get-NetAdapter -Physical) {
+        $stats = $null
+        $profile = $null
+        $linkLocalOnly = $null
+        if ($null -ne $profiles) {
+            $profile = $profiles | Where-Object InterfaceIndex -eq $adapter.ifIndex | Select-Object -First 1
+        }
+        try { $stats = $adapter | Get-NetAdapterStatistics } catch {}
+        if ($adapter.Status -eq 'Up') {
+            try {
+                $addresses = @(Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4)
+                if ($addresses.Count) {
+                    $linkLocalOnly = (@($addresses | Where-Object { $_.IPAddress -notlike '169.254.*' }).Count -eq 0)
+                }
+            } catch {}
+        }
+        [ordered]@{
+            description = $adapter.InterfaceDescription
+            status = [string]$adapter.Status
+            receive_errors = $stats.ReceivedPacketErrors
+            send_errors = $stats.OutboundPacketErrors
+            receive_discarded = $stats.ReceivedDiscardedPackets
+            send_discarded = $stats.OutboundDiscardedPackets
+            ipv4_link_local_only = $linkLocalOnly
+            ipv4_connectivity = $(if ($profile) { [string]$profile.IPv4Connectivity })
+            ipv6_connectivity = $(if ($profile) { [string]$profile.IPv6Connectivity })
+        }
+    }
+}
+
+function Read-DiagnosticQuery([scriptblock]$Query) {
+    try {
+        $value = & $Query
+        if ($null -eq $value) { return @{ state = 'unavailable' } }
+        return @{ state = 'checked'; data = $value }
+    } catch {
+        return @{ state = 'unavailable' }
+    }
+}
+
+function Get-VolumeData {
+    [ordered]@{
+        volumes = Read-DiagnosticQuery {
+            ,@(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType = 3' | ForEach-Object {
+                [ordered]@{
+                    drive = $_.DeviceID
+                    file_system = $_.FileSystem
+                    dirty = $_.VolumeDirty
+                    free_bytes = $_.FreeSpace
+                    size_bytes = $_.Size
+                }
+            })
+        }
+        disk_map = Read-DiagnosticQuery {
+            ,@(Get-Partition | Where-Object { $_.DriveLetter -match '^[A-Z]$' } | ForEach-Object {
+                @{ drive = "$($_.DriveLetter):"; disk = $_.DiskNumber }
+            })
+        }
+    }
+}
+
+function Get-DriverData {
+    [ordered]@{
+        devices = Read-DiagnosticQuery {
+            $packages = @{}
+            Get-CimInstance Win32_PnPSignedDriver | ForEach-Object {
+                if ($_.DeviceID) { $packages[$_.DeviceID] = $_ }
+            }
+            ,@(Get-CimInstance Win32_PnPEntity -Filter 'Present = TRUE' | ForEach-Object {
+                $package = $packages[$_.DeviceID]
+                [ordered]@{
+                    name = $_.Name
+                    class = $_.PNPClass
+                    error_code = $_.ConfigManagerErrorCode
+                    version = $package.DriverVersion
+                    signed = $package.IsSigned
+                }
+            })
+        }
+    }
+}
+
+function Get-PlatformData {
+    [ordered]@{
+        firmware = Read-DiagnosticQuery {
+            $bios = Get-CimInstance Win32_BIOS
+            $os = Get-CimInstance Win32_OperatingSystem
+            @{
+                version = $bios.SMBIOSBIOSVersion
+                last_boot = $os.LastBootUpTime.ToUniversalTime().ToString('o')
+            }
+        }
+        memory = Read-DiagnosticQuery {
+            ,@(Get-CimInstance Win32_PhysicalMemory | ForEach-Object {
+                @{ capacity_bytes = $_.Capacity; configured_mts = $_.ConfiguredClockSpeed }
+            })
+        }
+        power = Read-DiagnosticQuery {
+            Add-Type -AssemblyName System.Windows.Forms
+            $power = [System.Windows.Forms.SystemInformation]::PowerStatus
+            @{
+                ac = [string]$power.PowerLineStatus
+                battery_status = [string]$power.BatteryChargeStatus
+            }
+        }
+        thermal = Read-DiagnosticQuery {
+            $zones = @(Get-CimInstance -Namespace root/wmi -ClassName MSAcpi_ThermalZoneTemperature |
+                Where-Object { $_.CurrentTemperature -gt 0 } | ForEach-Object {
+                    @{ celsius = [math]::Round($_.CurrentTemperature / 10.0 - 273.15, 1) }
+                } | Where-Object { $_.celsius -ge -20 -and $_.celsius -le 150 })
+            if ($zones.Count) { ,$zones }
+        }
+    }
+}
+
+function Get-WindowsHealthData {
+    [ordered]@{
+        reboot = Read-DiagnosticQuery {
+            @{
+                component_servicing = Test-Path -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'
+                windows_update = Test-Path -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
+            }
+        }
+        page_file = Read-DiagnosticQuery {
+            $computer = Get-CimInstance Win32_ComputerSystem
+            @{
+                managed = $computer.AutomaticManagedPagefile
+                files = @(Get-CimInstance Win32_PageFileUsage | ForEach-Object {
+                    @{ allocated_mib = $_.AllocatedBaseSize; used_mib = $_.CurrentUsage; peak_mib = $_.PeakUsage }
+                })
+            }
+        }
+        component_store = Read-DiagnosticQuery {
+            $image = Repair-WindowsImage -Online -CheckHealth -LimitAccess -NoRestart
+            if ($null -ne $image.ImageHealthState) { @{ health = [string]$image.ImageHealthState } }
+        }
+    }
+}
+
+function Get-VerifiedComponentStore {
+    $image = Repair-WindowsImage -Online -ScanHealth -LimitAccess -NoRestart
+    if ($null -eq $image.ImageHealthState) { throw 'Component-store health unavailable' }
+    @{ health = [string]$image.ImageHealthState }
+}
+
+function Get-ProtectionData {
+    [ordered]@{
+        secure_boot = Read-DiagnosticQuery { @{ enabled = Confirm-SecureBootUEFI } }
+        tpm = Read-DiagnosticQuery {
+            $tpm = Get-Tpm
+            if ($tpm) { @{ present = $tpm.TpmPresent; ready = $tpm.TpmReady } }
+        }
+        firewall = Read-DiagnosticQuery {
+            ,@(Get-NetFirewallProfile -PolicyStore ActiveStore | ForEach-Object {
+                @{ profile = $_.Name; enabled = [string]$_.Enabled }
+            })
+        }
+        defender = Read-DiagnosticQuery {
+            $defender = Get-MpComputerStatus
+            if ($defender) {
+                @{ mode = $defender.AMRunningMode; realtime = $defender.RealTimeProtectionEnabled }
+            }
+        }
+        encryption = Read-DiagnosticQuery {
+            $volume = Get-BitLockerVolume -MountPoint $env:SystemDrive
+            if ($volume) {
+                @{ protection = [string]$volume.ProtectionStatus; status = [string]$volume.VolumeStatus }
+            }
+        }
+    }
+}
+
 function Get-PerformanceData {
     $os = Get-CimInstance Win32_OperatingSystem
+    $startProcesses = @()
+    $endProcesses = @()
+    try { $startProcesses = @(Get-ProcessData) } catch {}
     $samples = @(
-        for ($i = 0; $i -lt 5; $i++) {
+        for ($i = 0; $i -lt 8; $i++) {
             $memory = $null
             $disk = $null
             $cpu = $null
@@ -139,18 +357,25 @@ function Get-PerformanceData {
             try { $disk = Get-CimInstance Win32_PerfFormattedData_PerfDisk_PhysicalDisk -Filter "Name = '_Total'" } catch {}
             try { $cpu = Get-CimInstance Win32_PerfFormattedData_PerfOS_Processor -Filter "Name = '_Total'" } catch {}
             [ordered]@{
+                time = [DateTime]::UtcNow.ToString('o')
+                commit_bytes = $memory.CommittedBytes
+                commit_limit_bytes = $memory.CommitLimit
                 memory_total_mib = [double]$os.TotalVisibleMemorySize / 1024
                 memory_available_mib = $memory.AvailableMBytes
                 pages_input_sec = $memory.PagesInputPersec
                 disk_queue = $disk.AvgDiskQueueLength
                 cpu_percent = $cpu.PercentProcessorTime
             }
-            if ($i -lt 4) { Start-Sleep -Seconds 1 }
+            if ($i -lt 7) { Start-Sleep -Seconds 1 }
         }
     )
-    $volume = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID = '$($env:SystemDrive)'"
+    try { $endProcesses = @(Get-ProcessData) } catch {}
+    $volume = $null
+    try { $volume = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID = '$($env:SystemDrive)'" } catch {}
     [ordered]@{
         samples = $samples
+        processes_start = $startProcesses
+        processes_end = $endProcesses
         system_drive = $env:SystemDrive
         system_size = $volume.Size
         system_free = $volume.FreeSpace
@@ -163,5 +388,12 @@ switch ($Section) {
     storage { $result = @(Get-StorageData) }
     events { $result = Get-EventData }
     performance { $result = Get-PerformanceData }
+    network { $result = @(Get-NetworkData) }
+    volumes { $result = Get-VolumeData }
+    drivers { $result = Get-DriverData }
+    platform { $result = Get-PlatformData }
+    windows_health { $result = Get-WindowsHealthData }
+    protection { $result = Get-ProtectionData }
+    verify_windows { $result = Get-VerifiedComponentStore }
 }
 ConvertTo-Json -InputObject $result -Depth 8 -Compress
