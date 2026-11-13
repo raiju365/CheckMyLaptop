@@ -33,6 +33,8 @@ py -3 -m checkmylaptop --demo --cli
 
 On Linux or macOS, use `python3 -m checkmylaptop --demo --cli` for a simulated report.
 
+The Windows ZIP includes the Go performance collector. For a source checkout, see the [build instructions](CONTRIBUTING.md#windows-packaging) to compile it. Source scans without the helper use Windows PowerShell.
+
 In an interactive terminal, type `ALLOW` to start a live scan. Use `--allow` to explicitly authorize a scripted run. Demo mode uses simulated data.
 
 The normal scan uses your current Windows privileges. For a full component-store verification, use a trusted copy of the app in a directory other users cannot modify, open it with **Run as administrator**, and select **Verify Windows components**. From source, run the following in an elevated terminal. Windows records a servicing log and the check can take up to 15 minutes. Windows may also log the quick health query during an elevated normal scan.
@@ -48,7 +50,7 @@ py -3 -m checkmylaptop --cli --allow --verify-windows --json report.json
 | Hardware and drivers | Device Manager problem codes, present-device driver versions and signing status, BIOS, uptime and RAM modules |
 | Battery and power | Design and full-charge capacities, cycle counts, AC status, firmware CPU-limit events and exposed ACPI thermal zones |
 | Storage and file systems | Disk health and reliability counters, fixed volume free space and dirty flags, volume-to-disk mapping and selected NTFS events |
-| Memory and performance | Eight samples of available RAM, commit usage, page reads, disk queue and CPU load, plus process-group memory, page-file usage and previous memory diagnostic or exhaustion events |
+| Memory and performance | Eight samples of available RAM, commit usage, page reads, disk queue and CPU load, plus process-group memory, page-file usage and previous memory diagnostic or exhaustion events. The Go collector also reads aggregate disk throughput and read/write latency. |
 | Network | Physical adapter state, local packet counters and Windows IPv4/IPv6 connectivity classification |
 | Windows reliability | Selected graphics recovery, bugcheck, application failures, WHEA and Windows Update events, plus servicing reboot indicators and component-store status |
 | Windows protection | Secure Boot, TPM, Windows Firewall profiles, Defender mode and system-volume BitLocker status, where supported and accessible |

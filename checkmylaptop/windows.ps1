@@ -74,7 +74,7 @@ function Get-StorageData {
 
 function Get-EventData {
     $start = (Get-Date).AddDays(-14)
-    $boot = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
+    $boot = (Get-CimInstance Win32_OperatingSystem -Property LastBootUpTime).LastBootUpTime
     $queries = @(
         @{ ProviderName = 'Microsoft-Windows-Kernel-Power'; Id = 41 },
         @{ ProviderName = 'Microsoft-Windows-WHEA-Logger'; Id = @(17, 18, 19, 20, 46, 47) },
@@ -134,11 +134,11 @@ function Get-EventData {
 }
 
 function Get-InventoryData {
-    $computer = Get-CimInstance Win32_ComputerSystem
-    $os = Get-CimInstance Win32_OperatingSystem
-    $cpu = @(Get-CimInstance Win32_Processor | ForEach-Object { $_.Name.Trim() })
-    $gpu = @(Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name)
-    $devices = @(Get-CimInstance Win32_PnPEntity -Filter 'Present = TRUE')
+    $computer = Get-CimInstance Win32_ComputerSystem -Property Manufacturer,Model,TotalPhysicalMemory
+    $os = Get-CimInstance Win32_OperatingSystem -Property Caption,BuildNumber
+    $cpu = @(Get-CimInstance Win32_Processor -Property Name | ForEach-Object { $_.Name.Trim() })
+    $gpu = @(Get-CimInstance Win32_VideoController -Property Name | Select-Object -ExpandProperty Name)
+    $devices = @(Get-CimInstance Win32_PnPEntity -Filter 'Present = TRUE' -Property Name,PNPClass,ConfigManagerErrorCode)
     $deviceIssues = @($devices | Where-Object { $_.ConfigManagerErrorCode -notin @(0, 22, $null) } |
         Select-Object -First 25 Name, PNPClass, ConfigManagerErrorCode)
     $deviceClasses = @($devices | Group-Object PNPClass | Where-Object { $_.Name } |
@@ -235,11 +235,12 @@ function Get-VolumeData {
 function Get-DriverData {
     [ordered]@{
         devices = Read-DiagnosticQuery {
+            $devices = @(Get-CimInstance Win32_PnPEntity -Filter 'Present = TRUE' -Property DeviceID,Name,PNPClass,ConfigManagerErrorCode)
             $packages = @{}
-            Get-CimInstance Win32_PnPSignedDriver | ForEach-Object {
+            Get-CimInstance Win32_PnPSignedDriver -Property DeviceID,DriverVersion,IsSigned | ForEach-Object {
                 if ($_.DeviceID) { $packages[$_.DeviceID] = $_ }
             }
-            ,@(Get-CimInstance Win32_PnPEntity -Filter 'Present = TRUE' | ForEach-Object {
+            ,@($devices | ForEach-Object {
                 $package = $packages[$_.DeviceID]
                 [ordered]@{
                     name = $_.Name
@@ -344,20 +345,22 @@ function Get-ProtectionData {
 }
 
 function Get-PerformanceData {
-    $os = Get-CimInstance Win32_OperatingSystem
+    $os = Get-CimInstance Win32_OperatingSystem -Property TotalVisibleMemorySize
     $startProcesses = @()
     $endProcesses = @()
     try { $startProcesses = @(Get-ProcessData) } catch {}
     $samples = @(
         for ($i = 0; $i -lt 8; $i++) {
+            $interval = [Diagnostics.Stopwatch]::StartNew()
+            $sampleTime = [DateTime]::UtcNow.ToString('o')
             $memory = $null
             $disk = $null
             $cpu = $null
-            try { $memory = Get-CimInstance Win32_PerfFormattedData_PerfOS_Memory } catch {}
-            try { $disk = Get-CimInstance Win32_PerfFormattedData_PerfDisk_PhysicalDisk -Filter "Name = '_Total'" } catch {}
-            try { $cpu = Get-CimInstance Win32_PerfFormattedData_PerfOS_Processor -Filter "Name = '_Total'" } catch {}
+            try { $memory = Get-CimInstance Win32_PerfFormattedData_PerfOS_Memory -Property CommittedBytes,CommitLimit,AvailableMBytes,PagesInputPersec } catch {}
+            try { $disk = Get-CimInstance Win32_PerfFormattedData_PerfDisk_PhysicalDisk -Filter "Name = '_Total'" -Property AvgDiskQueueLength } catch {}
+            try { $cpu = Get-CimInstance Win32_PerfFormattedData_PerfOS_Processor -Filter "Name = '_Total'" -Property PercentProcessorTime } catch {}
             [ordered]@{
-                time = [DateTime]::UtcNow.ToString('o')
+                time = $sampleTime
                 commit_bytes = $memory.CommittedBytes
                 commit_limit_bytes = $memory.CommitLimit
                 memory_total_mib = [double]$os.TotalVisibleMemorySize / 1024
@@ -366,7 +369,8 @@ function Get-PerformanceData {
                 disk_queue = $disk.AvgDiskQueueLength
                 cpu_percent = $cpu.PercentProcessorTime
             }
-            if ($i -lt 7) { Start-Sleep -Seconds 1 }
+            $remaining = 1000 - $interval.ElapsedMilliseconds
+            if ($i -lt 7 -and $remaining -gt 0) { Start-Sleep -Milliseconds $remaining }
         }
     )
     try { $endProcesses = @(Get-ProcessData) } catch {}

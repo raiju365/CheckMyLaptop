@@ -1,4 +1,4 @@
-"""Exercise the bundled PowerShell on an actual Windows runner."""
+"""Exercise the diagnostic collectors on an actual Windows runner."""
 
 import sys
 from pathlib import Path
@@ -23,6 +23,12 @@ if len(sections["performance"]["data"]["samples"]) != 8:
 report = build_report(snapshot)
 assert report["schema_version"] == 2 and report["coverage"]
 assert report["measurements"]["performance"]["processes"], "Process memory was not returned."
+if "--require-native" in sys.argv:
+    assert report["measurements"]["performance_source"] == "native", "Native performance collector was not used."
+    native_samples = report["measurements"]["performance_samples"]
+    assert all(row["memory_total_mib"] > 0 and row["commit_limit_bytes"] > 0 and
+               0 <= row["cpu_percent"] <= 100 and row["disk_queue"] >= 0
+               for row in native_samples), "Native performance counters were invalid."
 details = report["measurements"]["diagnostic_details"]
 assert details["volumes"]["volumes"], "No fixed volumes returned."
 assert details["drivers"]["devices"], "No present device records returned."

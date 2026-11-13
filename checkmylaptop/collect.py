@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
+from .performance import summarize_performance
+
 SECTIONS = {
     "inventory": ("Hardware inventory", dict),
     "battery": ("Battery", list),
@@ -43,10 +45,29 @@ VERIFICATION_NOTICE = (
     "Windows component verification can take up to 15 minutes and writes a Windows servicing log."
 )
 SCRIPT = Path(__file__).with_name("windows.ps1")
+NATIVE_NAME = "checkmylaptop-performance.exe"
+BACKGROUND_CHECKS = (
+    "protection", "drivers", "network", "volumes", "platform", "windows_health",
+    "storage", "inventory", "events", "battery",
+)
 
 
 def read_section(section: str) -> dict:
-    return _read_collector(section, SECTIONS[section][1], timeout=40)
+    if section == "performance" and sys.platform == "win32":
+        executable = SCRIPT.with_name(NATIVE_NAME) if getattr(sys, "frozen", False) else (
+            SCRIPT.parent.parent / "build" / NATIVE_NAME
+        )
+        if executable.is_file():
+            result = _read_json([str(executable), "--allow"], dict, timeout=15)
+            data = result.get("data", {})
+            if (isinstance(data.get("samples"), list) and len(data["samples"]) == 8
+                    and data.get("processes_start") and data.get("processes_end")):
+                data["source"] = "native"
+                return result
+    result = _read_collector(section, SECTIONS[section][1], timeout=40)
+    if section == "performance" and result["state"] == "checked":
+        result["data"]["source"] = "powershell"
+    return result
 
 
 def _read_collector(section: str, expected_type: type, *, timeout: int) -> dict:
@@ -59,6 +80,10 @@ def _read_collector(section: str, expected_type: type, *, timeout: int) -> dict:
         str(powershell), "-NoLogo", "-NoProfile", "-NonInteractive",
         "-ExecutionPolicy", "Bypass", "-File", str(SCRIPT), section,
     ]
+    return _read_json(command, expected_type, timeout=timeout)
+
+
+def _read_json(command: list[str], expected_type: type, *, timeout: int) -> dict:
     try:
         process = subprocess.run(
             command, capture_output=True, timeout=timeout, check=True,
@@ -86,19 +111,39 @@ def scan(progress: Callable[[str], None] | None = None, *, allow: bool = False,
     administrator = bool(ctypes.windll.shell32.IsUserAnAdmin())
     report = {"scanned_at": datetime.now(timezone.utc).isoformat(), "sections": {},
               "administrator": administrator}
-    with ThreadPoolExecutor(max_workers=4) as executor:
+    if progress:
+        progress("Sampling CPU, memory and disk while checking Windows…")
+    with ThreadPoolExecutor(max_workers=7) as executor:
+        performance = executor.submit(read_section, "performance")
         inventory_checks = {
             executor.submit(read_section, name): name
-            for name in SECTIONS if name != "performance"
+            for name in BACKGROUND_CHECKS
         }
         for future in as_completed(inventory_checks):
             name = inventory_checks[future]
             report["sections"][name] = future.result()
             if progress:
                 progress(f"Completed {SECTIONS[name][0].lower()}")
-    if progress:
-        progress("Sampling CPU, memory and disk…")
-    report["sections"]["performance"] = read_section("performance")
+    performance_result = performance.result()
+    if performance_result["state"] == "checked":
+        data = performance_result["data"]
+        metrics = summarize_performance(data)
+        if any(metrics[key] >= metrics["required"] for key in (
+            "low_count", "commit_high_count", "cpu_high_count", "queue_high_count",
+        )):
+            if progress:
+                progress("Rechecking performance after the other checks finished…")
+            performance_result = read_section("performance")
+            if performance_result["state"] == "checked":
+                performance_result["data"]["collection"] = "isolated"
+            else:
+                performance_result["reason"] = (
+                    "The parallel samples showed resource pressure. An isolated recheck could not confirm it. "
+                    + performance_result.get("reason", "")
+                ).strip()
+        else:
+            data["collection"] = "parallel"
+    report["sections"]["performance"] = performance_result
     if verify_windows:
         if administrator:
             if progress:

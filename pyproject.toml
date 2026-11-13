@@ -24,3 +24,6 @@ checkmylaptop = "checkmylaptop.__main__:main"
 
 [tool.setuptools.package-data]
 checkmylaptop = ["*.ps1"]
+
+[tool.setuptools.packages.find]
+include = ["checkmylaptop", "checkmylaptop.*"]

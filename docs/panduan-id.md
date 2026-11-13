@@ -8,6 +8,10 @@ CheckMyLaptop memeriksa laptop Windows setelah kamu memberi izin. Aplikasi memba
 4. Periksa **Scan coverage**. Status **Partial** berarti hanya sebagian data berhasil terbaca. **Unavailable** berarti data pemeriksaan tersebut tidak tersedia.
 5. Gunakan **Save report** untuk menyimpan laporan TXT atau JSON. Baca dulu laporannya sebelum dibagikan ke teknisi.
 
+Aplikasi mengambil delapan sampel performa sambil menjalankan pemeriksaan lain. Jika sampel menunjukkan beban berkelanjutan, aplikasi mengulangi pengukuran setelah pemeriksaan lain selesai untuk mengurangi pengaruh scan terhadap hasil.
+
+Paket Windows menyertakan kolektor Go. Saat counter tersedia, **Measured performance** juga menampilkan kecepatan dan latensi baca/tulis gabungan semua disk. Latensi dihitung dari sampel saat disk aktif. Jika kolektor Go gagal membaca data wajib, aplikasi beralih ke PowerShell.
+
 Aplikasi berfungsi sebagai pemeriksaan awal. Temuan membantu menentukan apa yang perlu diperiksa berikutnya. Gunakan diagnostik produsen atau bantuan teknisi untuk mengonfirmasi kerusakan sebelum mengganti komponen. Jika ada peringatan penyimpanan yang menyarankan pencadangan, dahulukan pencadangan file penting.
 
 Untuk verifikasi komponen Windows secara menyeluruh, buka aplikasi dengan **Run as administrator**, centang **Verify Windows components**, lalu beri izin scan. Verifikasi bisa berjalan hingga 15 menit dan Windows dapat menulis log servis. Pemeriksaan tetap berjalan lokal tanpa mengirim laporan atau menjalankan perbaikan.

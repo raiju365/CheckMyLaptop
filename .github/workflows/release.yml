@@ -16,10 +16,19 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.x"
+          cache: false
+      - name: Build the native performance collector
+        working-directory: native/performance
+        env:
+          CGO_ENABLED: "0"
+        run: go build -trimpath -o ../../build/checkmylaptop-performance.exe .
       - run: python -m unittest discover -s tests -v
-      - run: python tests/windows_smoke.py
+      - run: python tests/windows_smoke.py --require-native
       - run: python -m pip install -r requirements-build.txt
-      - run: python -m PyInstaller --clean --noconfirm --onedir --windowed --name CheckMyLaptop --add-data "checkmylaptop/windows.ps1;checkmylaptop" run_checkmylaptop.py
+      - run: python -m PyInstaller --clean --noconfirm --onedir --windowed --name CheckMyLaptop --add-data "checkmylaptop/windows.ps1;checkmylaptop" --add-binary "build/checkmylaptop-performance.exe;checkmylaptop" run_checkmylaptop.py
       - name: Verify the packaged application
         shell: pwsh
         run: |
@@ -28,6 +37,11 @@ jobs:
           if ($process.ExitCode -ne 0 -or -not (Test-Path $report)) { throw "Packaged demo failed" }
           $data = Get-Content -Raw $report | ConvertFrom-Json
           if (-not $data.demo -or -not $data.conclusions) { throw "Packaged report is invalid" }
+          $report = Join-Path $PWD "packaged-live.json"
+          $process = Start-Process -FilePath "dist/CheckMyLaptop/CheckMyLaptop.exe" -ArgumentList @("--allow", "--json", ('"{0}"' -f $report)) -Wait -PassThru
+          if ($process.ExitCode -ne 0 -or -not (Test-Path $report)) { throw "Packaged live scan failed" }
+          $data = Get-Content -Raw $report | ConvertFrom-Json
+          if ($data.measurements.performance_source -ne "native") { throw "Packaged scan did not use the native collector" }
           Compress-Archive -LiteralPath dist/CheckMyLaptop -DestinationPath dist/CheckMyLaptop-Windows-x64.zip
           $hash = (Get-FileHash dist/CheckMyLaptop-Windows-x64.zip -Algorithm SHA256).Hash.ToLower()
           "$hash  CheckMyLaptop-Windows-x64.zip" | Set-Content -Encoding ascii dist/SHA256SUMS.txt

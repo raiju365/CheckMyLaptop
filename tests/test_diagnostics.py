@@ -192,3 +192,41 @@ class DiagnosticTests(unittest.TestCase):
         with patch("sys.platform", "win32"), patch("sys.stdout", StringIO()):
             self.assertEqual(main(["--cli", "--allow", "--verify-windows"]), 0)
         scan.assert_called_once_with(allow=True, verify_windows=True)
+
+    def test_parallel_scan_preserves_coverage_and_rechecks_resource_pressure(self):
+        for pressured in (False, True):
+            with self.subTest(pressured=pressured):
+                parallel = snapshot()["sections"]["performance"]
+                isolated = snapshot()["sections"]["performance"]
+                for row in isolated["data"]["samples"]:
+                    row.update(memory_available_mib=3000, commit_bytes=0, disk_queue=0)
+                runs = iter((parallel, isolated) if pressured else (isolated,))
+
+                def collect_section(section):
+                    if section == "performance":
+                        return next(runs)
+                    return {"state": "unavailable"}
+
+                with (patch("sys.platform", "win32"),
+                      patch.object(collect.ctypes, "windll", create=True) as windows,
+                      patch.object(collect, "read_section", side_effect=collect_section) as read):
+                    windows.shell32.IsUserAnAdmin.return_value = False
+                    data = collect.scan(allow=True)
+
+                self.assertEqual(set(data["sections"]), set(collect.SECTIONS))
+                self.assertEqual(read.call_count, len(collect.SECTIONS) + int(pressured))
+                report = build_report(data)
+                expected = "isolated" if pressured else "parallel"
+                self.assertEqual(report["measurements"]["performance_collection"], expected)
+                self.assertNotIn("memory_paging", {item["code"] for item in report["findings"]})
+
+    def test_performance_falls_back_when_native_helper_fails(self):
+        fallback = snapshot()["sections"]["performance"]
+        with (patch("sys.platform", "win32"),
+              patch.object(collect.Path, "is_file", return_value=True),
+              patch.object(collect, "_read_json", return_value={"state": "unavailable"}) as native,
+              patch.object(collect, "_read_collector", return_value=fallback) as powershell):
+            result = collect.read_section("performance")
+        self.assertEqual(native.call_args.args[0][-1], "--allow")
+        powershell.assert_called_once_with("performance", dict, timeout=40)
+        self.assertEqual(result["data"]["source"], "powershell")

@@ -44,6 +44,10 @@ def build_report(snapshot: dict, *, demo: bool = False) -> dict:
                 elif count < len(samples) or not samples or not data.get("system_size"):
                     status = "partial"
                 details = f"{count} complete performance samples out of {len(samples)}."
+                if data.get("collection") == "parallel":
+                    details += " Sampled while other checks ran."
+                elif data.get("collection") == "isolated":
+                    details += " Rechecked after other collectors finished."
                 if not data.get("processes_end"):
                     details += " Process memory unavailable."
                     if status == "checked":
@@ -101,6 +105,8 @@ def build_report(snapshot: dict, *, demo: bool = False) -> dict:
         "recent_events": timeline,
         "measurements": {
             "performance": metrics, "performance_samples": perf.get("samples", []),
+            "performance_collection": perf.get("collection"),
+            "performance_source": perf.get("source"),
             "battery": battery, "storage": storage, "network": network,
             "diagnostic_details": detail_measurements(sections),
             "component_store": {"health": health, "verified": verified},
@@ -158,6 +164,15 @@ def render_text(report: dict) -> str:
                 lines.append(f"  {label}: {value:.1f} {unit}".rstrip())
         if metrics["commit_peak_ratio"] is not None:
             lines.append(f"  Peak commit usage: {metrics['commit_peak_ratio']:.1%} of limit")
+        disk_io = metrics.get("disk_io", {})
+        for direction in ("read", "write"):
+            throughput = disk_io.get(f"{direction}_median_mib_sec")
+            latency = disk_io.get(f"{direction}_median_latency_ms")
+            if throughput is not None:
+                lines.append(f"  Disk {direction} throughput, median: {throughput:.2f} MiB/s")
+            if latency is not None:
+                count = disk_io[f"{direction}_latency_samples"]
+                lines.append(f"  Disk {direction} latency, median: {latency:.2f} ms ({count} active samples)")
         if metrics["processes"]:
             lines.append("  Top process groups by resident memory at the end of the scan")
             for row in metrics["processes"]:

@@ -20,6 +20,17 @@ jobs:
           python-version: "3.12"
       - run: python -m unittest discover -s tests -v
       - run: python -m checkmylaptop --demo --cli --json demo-report.json
+      - uses: actions/setup-go@v5
+        if: runner.os == 'Windows'
+        with:
+          go-version: "1.25.x"
+          cache: false
+      - name: Build the native performance collector
+        if: runner.os == 'Windows'
+        working-directory: native/performance
+        env:
+          CGO_ENABLED: "0"
+        run: go build -trimpath -o ../../build/checkmylaptop-performance.exe .
       - name: Smoke-test Windows collectors
         if: runner.os == 'Windows'
-        run: python tests/windows_smoke.py
+        run: python tests/windows_smoke.py --require-native

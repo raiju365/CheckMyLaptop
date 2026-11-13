@@ -62,6 +62,15 @@ def summarize_performance(data: dict) -> dict:
 
     cpu, queue, page_reads = (measurement(key) for key in
                               ("cpu_percent", "disk_queue", "pages_input_sec"))
+    disk_io = {}
+    for direction in ("read", "write"):
+        throughput = measurement(f"disk_{direction}_bytes_sec")
+        latency = measurement(f"disk_{direction}_latency_ms")
+        if throughput:
+            disk_io[f"{direction}_median_mib_sec"] = median(throughput) / MIB
+        if latency:
+            disk_io[f"{direction}_median_latency_ms"] = median(latency)
+            disk_io[f"{direction}_latency_samples"] = len(latency)
     return {
         "samples": len(samples), "required": max(3, ceil(len(samples) * 0.6)),
         "low_count": len(low), "paging_count": len(paging), "commit_high_count": len(commit_high),
@@ -75,5 +84,6 @@ def summarize_performance(data: dict) -> dict:
         "cpu_median_percent": median(cpu) if cpu else None,
         "disk_queue_median": median(queue) if queue else None,
         "pages_input_median": median(page_reads) if page_reads else None,
+        "disk_io": disk_io,
         "processes": sorted(apps, key=lambda row: row["working_set_mib"], reverse=True)[:5],
     }
