@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "checkmylaptop"
+version = "0.1.0"
+description = "One-click, evidence-based laptop diagnostics for Windows."
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+classifiers = [
+    "Operating System :: Microsoft :: Windows :: Windows 11",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Hardware",
+]
+
+[project.urls]
+Repository = "https://github.com/raiju365/CheckMyLaptop"
+Issues = "https://github.com/raiju365/CheckMyLaptop/issues"
+
+[project.scripts]
+checkmylaptop = "checkmylaptop.__main__:main"
+
+[tool.setuptools.package-data]
+checkmylaptop = ["*.ps1"]

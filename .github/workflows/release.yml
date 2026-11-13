@@ -1,0 +1,55 @@
+name: Windows release build
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m unittest discover -s tests -v
+      - run: python tests/windows_smoke.py
+      - run: python -m pip install -r requirements-build.txt
+      - run: python -m PyInstaller --clean --noconfirm --onefile --windowed --name CheckMyLaptop --add-data "checkmylaptop/windows.ps1;checkmylaptop" run_checkmylaptop.py
+      - name: Verify the packaged application
+        shell: pwsh
+        run: |
+          $report = Join-Path $PWD "packaged-demo.json"
+          $process = Start-Process -FilePath "dist/CheckMyLaptop.exe" -ArgumentList @("--demo", "--json", ('"{0}"' -f $report)) -Wait -PassThru
+          if ($process.ExitCode -ne 0 -or -not (Test-Path $report)) { throw "Packaged demo failed" }
+          $data = Get-Content -Raw $report | ConvertFrom-Json
+          if (-not $data.demo -or -not $data.findings) { throw "Packaged report is invalid" }
+          $hash = (Get-FileHash dist/CheckMyLaptop.exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  CheckMyLaptop.exe" | Set-Content -Encoding ascii dist/SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CheckMyLaptop-Windows-x64
+          path: |
+            dist/CheckMyLaptop.exe
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+
+  draft:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: CheckMyLaptop-Windows-x64
+          path: dist
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/CheckMyLaptop.exe dist/SHA256SUMS.txt --repo "$GITHUB_REPOSITORY" --verify-tag --draft --generate-notes
